@@ -1,55 +1,44 @@
-using System.Diagnostics.CodeAnalysis;
 using UnityEngine;
 using DefaultNamespace;
-using UnityEditor;
+using Lineart.Pipeline;
 
+/// <summary>
+/// Smooth (interpolated normal) silhouette: one contour segment per triangle where N.V changes sign,
+/// chained across adjacent triangles into Grease Pencil strokes.
+/// </summary>
 public class SilhouetteEdgeCalculator : MonoBehaviour, IGreasePencilEdgeCalculator
 {
-    private ComputeShader _silhouetteEdgeFinder;
-    private ComputeShader _edgesToStrokes;
-    private ComputeShader _strokesToGreasePencilStrokes;
+    const string FinderShaderPath = "Lineart/ComputeShaders/SilhouetteEdge";
 
-    private Mesh _sourceMesh;
-    private int FaceCount => _sourceMesh.triangles.Length / 3;
-
-    private SilhouetteBufferContext _buffers;
+    static readonly int NumFacesId = Shader.PropertyToID("_NumFaces");
+    static readonly int SkipConcaveId = Shader.PropertyToID("_SkipConcave");
+    static readonly int ConcaveToleranceId = Shader.PropertyToID("_ConcaveTolerance");
 
     public Camera viewCamera;
     public float radiusMultiplier = 1.0f;
     public float lateralShiftFactor = 1.0f;
     public float lateralShiftConstant;
 
-    private int _findSilhouetteEdge_Kernel;
+    [Tooltip("Drop contour segments on concave folds (Blender: Skip Concave Edges).")]
+    public bool skipConcaveEdges;
+    [Tooltip("Fold tolerance (Blender: Concave Tolerance).")]
+    public float concaveTolerance = 0.001f;
 
-    private int _initialize_Kernel;
-    private int _findStrokeTail_Kernel;
-    private int _resetNext_Kernel;
-    private int _initRanks_Kernel;
-    private int _listRank_Kernel;
-    private int _finalizeRanks_Kernel;
-    private int _setStrokeLengthAtTail_Kernel;
-    private int _calcStrokeOffsets_Kernel;
-    private int _invalidateEntries_Kernel;
-    private int _sorter_Kernel;
-    private int _buildDenseNextPointers_Kernel;
-    private int _offsetDenseScreenPositions_Kernel;
-    private int _initDenseScreenDistances_Kernel;
-    private int _densePointerJumpDistances_Kernel;
-    private int _finalizeDenseScreenDistances_Kernel;
+    private ComputeShader _silhouetteEdgeFinder;
+    private int _findSilhouetteEdgeKernel;
+    private StrokeChainRanker _ranker;
+    private DenseStrokeBuilder _denseBuilder;
 
-    private const uint NUM_POINTER_JUMP_ITERATIONS = 8;
-    private const float KERNEL_SIZE = 128.0f;
+    private Mesh _sourceMesh;
+    private SilhouetteBufferContext _buffers;
+
+    public Camera ViewCamera => viewCamera;
 
     private void Awake()
     {
-        _silhouetteEdgeFinder = Instantiate(Resources.Load<ComputeShader>("Lineart/ComputeShaders/SilhouetteEdge"));
-        _edgesToStrokes = Instantiate(Resources.Load<ComputeShader>("Lineart/ComputeShaders/EdgesToStrokes"));
-        _strokesToGreasePencilStrokes = Instantiate(Resources.Load<ComputeShader>("Lineart/ComputeShaders/StrokesToGreasePencil"));
-
         _sourceMesh = GetComponent<MeshFilter>()?.sharedMesh;
+        viewCamera = ViewCameraResolver.Resolve(viewCamera);
 
-        ResolveViewCamera();
-            
         if (!SystemInfo.supportsComputeShaders)
         {
             Debug.LogError("Compute shaders are not supported on this platform.");
@@ -61,132 +50,51 @@ public class SilhouetteEdgeCalculator : MonoBehaviour, IGreasePencilEdgeCalculat
             return;
         }
 
-        InitializeKernels();
+        _silhouetteEdgeFinder = LineartCompute.LoadInstance(FinderShaderPath);
+        _findSilhouetteEdgeKernel = _silhouetteEdgeFinder.FindKernel("FindSilhouetteEdge");
+        _ranker = new StrokeChainRanker();
+        _denseBuilder = new DenseStrokeBuilder();
+
         _buffers = SilhouetteBufferContext.CreateForSmooth(_sourceMesh);
-        BindBuffersToShaders();
-        
+        BindFinderBuffers();
     }
 
-    private void ResolveViewCamera()
+    private void BindFinderBuffers()
     {
-#if UNITY_EDITOR
-        if (viewCamera == null)
-        {
-            SceneView sceneView = SceneView.lastActiveSceneView;
-            viewCamera = sceneView != null ? sceneView.camera : Camera.main;
-        }
-#else
-        if (viewCamera == null) viewCamera = Camera.main;
-#endif
-    }
-
-
-    void InitializeKernels()
-    {
-        _findSilhouetteEdge_Kernel = _silhouetteEdgeFinder.FindKernel("FindSilhouetteEdge");
-
-        _initialize_Kernel = _edgesToStrokes.FindKernel("Initialize");
-        _findStrokeTail_Kernel = _edgesToStrokes.FindKernel("FindStrokeTail");
-        _resetNext_Kernel = _edgesToStrokes.FindKernel("ResetNextPointer");
-        _initRanks_Kernel = _edgesToStrokes.FindKernel("InitializeRanks");
-        _listRank_Kernel = _edgesToStrokes.FindKernel("CalculateRanks");
-        _finalizeRanks_Kernel = _edgesToStrokes.FindKernel("FinalizeRanks");
-        _setStrokeLengthAtTail_Kernel = _strokesToGreasePencilStrokes.FindKernel("SetStrokeLengthAtTail");
-        _calcStrokeOffsets_Kernel = _strokesToGreasePencilStrokes.FindKernel("CalculateArrayOffsets");
-        _invalidateEntries_Kernel = _strokesToGreasePencilStrokes.FindKernel("InvalidateEntries");
-        _sorter_Kernel = _strokesToGreasePencilStrokes.FindKernel("MoveToDenseArray");
-        _buildDenseNextPointers_Kernel = _strokesToGreasePencilStrokes.FindKernel("BuildDenseNextPointers");
-        _offsetDenseScreenPositions_Kernel = _strokesToGreasePencilStrokes.FindKernel("OffsetDenseScreenPositions");
-        _initDenseScreenDistances_Kernel = _strokesToGreasePencilStrokes.FindKernel("InitDenseScreenDistances");
-        _densePointerJumpDistances_Kernel = _strokesToGreasePencilStrokes.FindKernel("DensePointerJumpDistances");
-        _finalizeDenseScreenDistances_Kernel = _strokesToGreasePencilStrokes.FindKernel("FinalizeDenseScreenDistances");
-    }
-
-    [SuppressMessage("ReSharper", "Unity.PreferAddressByIdToGraphicsParams")]
-    void BindBuffersToShaders()
-    {
-        _silhouetteEdgeFinder.SetInt("_NumFaces", _buffers.FaceCount);
-        _silhouetteEdgeFinder.SetBuffer(_findSilhouetteEdge_Kernel, "_Vertices", _buffers.Vertices);
-        _silhouetteEdgeFinder.SetBuffer(_findSilhouetteEdge_Kernel, "_Indices", _buffers.Indices);
-        _silhouetteEdgeFinder.SetBuffer(_findSilhouetteEdge_Kernel, "_AdjIndices", _buffers.AdjIndices);
-        _silhouetteEdgeFinder.SetBuffer(_findSilhouetteEdge_Kernel, "_outStrokes", _buffers.Strokes);
-
-        _edgesToStrokes.SetInt("_NumFaces", _buffers.FaceCount);
-        _edgesToStrokes.SetBuffer(_initialize_Kernel, "_strokes", _buffers.Strokes);
-        _edgesToStrokes.SetBuffer(_findStrokeTail_Kernel, "_strokes", _buffers.Strokes);
-        _edgesToStrokes.SetBuffer(_listRank_Kernel, "_strokes", _buffers.Strokes);
-        _edgesToStrokes.SetBuffer(_resetNext_Kernel, "_strokes", _buffers.Strokes);
-        _edgesToStrokes.SetBuffer(_initRanks_Kernel, "_strokes", _buffers.Strokes);
-        _edgesToStrokes.SetBuffer(_finalizeRanks_Kernel, "_strokes", _buffers.Strokes);
-
-        _strokesToGreasePencilStrokes.SetInt("_NumFaces", _buffers.FaceCount);
-
-        _strokesToGreasePencilStrokes.SetBuffer(_setStrokeLengthAtTail_Kernel, "_strokes", _buffers.Strokes);
-
-        _strokesToGreasePencilStrokes.SetBuffer(_calcStrokeOffsets_Kernel, "_strokes", _buffers.Strokes);
-        _strokesToGreasePencilStrokes.SetBuffer(_calcStrokeOffsets_Kernel, "numStrokesCounter", _buffers.NumStrokesCounter);
-        _strokesToGreasePencilStrokes.SetBuffer(_calcStrokeOffsets_Kernel, "numStrokePointsCounter", _buffers.NumStrokePointsCounter);
-
-        _strokesToGreasePencilStrokes.SetBuffer(_invalidateEntries_Kernel, "_denseArray", _buffers.DenseStrokes);
-
-        _strokesToGreasePencilStrokes.SetBuffer(_sorter_Kernel, "_strokes", _buffers.Strokes);
-        _strokesToGreasePencilStrokes.SetBuffer(_sorter_Kernel, "_denseArray", _buffers.DenseStrokes);
-        _strokesToGreasePencilStrokes.SetBuffer(_sorter_Kernel, "_colorArray", _buffers.Color);
-
-        _strokesToGreasePencilStrokes.SetBuffer(_buildDenseNextPointers_Kernel, "_denseArray", _buffers.DenseStrokes);
-        _strokesToGreasePencilStrokes.SetBuffer(_buildDenseNextPointers_Kernel, SilhouetteShaderIDs.DenseNextPointerDst, _buffers.DenseNextPointerDst);
-
-        _strokesToGreasePencilStrokes.SetBuffer(_offsetDenseScreenPositions_Kernel, "_denseArray", _buffers.DenseStrokes);
-
-        _strokesToGreasePencilStrokes.SetBuffer(_initDenseScreenDistances_Kernel, "_denseArray", _buffers.DenseStrokes);
-        _strokesToGreasePencilStrokes.SetBuffer(_initDenseScreenDistances_Kernel, SilhouetteShaderIDs.DenseUStrokeDst, _buffers.DenseUStrokeDst);
-
-        _strokesToGreasePencilStrokes.SetBuffer(_densePointerJumpDistances_Kernel, "_denseArray", _buffers.DenseStrokes);
-        _strokesToGreasePencilStrokes.SetBuffer(_densePointerJumpDistances_Kernel, SilhouetteShaderIDs.DenseNextPointerSrc, _buffers.DenseNextPointerSrc);
-        _strokesToGreasePencilStrokes.SetBuffer(_densePointerJumpDistances_Kernel, SilhouetteShaderIDs.DenseNextPointerDst, _buffers.DenseNextPointerDst);
-        _strokesToGreasePencilStrokes.SetBuffer(_densePointerJumpDistances_Kernel, SilhouetteShaderIDs.DenseUStrokeSrc, _buffers.DenseUStrokeSrc);
-        _strokesToGreasePencilStrokes.SetBuffer(_densePointerJumpDistances_Kernel, SilhouetteShaderIDs.DenseUStrokeDst, _buffers.DenseUStrokeDst);
-
-        _strokesToGreasePencilStrokes.SetBuffer(_finalizeDenseScreenDistances_Kernel, "_denseArray", _buffers.DenseStrokes);
-        _strokesToGreasePencilStrokes.SetBuffer(_finalizeDenseScreenDistances_Kernel, SilhouetteShaderIDs.DenseUStrokeSrc, _buffers.DenseUStrokeSrc);
-    }
-
-    private void BindNextPointers(int kernel)
-    {
-        _edgesToStrokes.SetBuffer(kernel, SilhouetteShaderIDs.NextPointerSrc, _buffers.NextPointerSrc);
-        _edgesToStrokes.SetBuffer(kernel, SilhouetteShaderIDs.NextPointerDst, _buffers.NextPointerDst);
-    }
-
-    private void BindRankBuffers(int kernel)
-    {
-        _edgesToStrokes.SetBuffer(kernel, SilhouetteShaderIDs.RankSrc, _buffers.RankSrc);
-        _edgesToStrokes.SetBuffer(kernel, SilhouetteShaderIDs.RankDst, _buffers.RankDst);
-    }
-
-    private void BindDenseNextPointers(int kernel)
-    {
-        _strokesToGreasePencilStrokes.SetBuffer(kernel, SilhouetteShaderIDs.DenseNextPointerSrc, _buffers.DenseNextPointerSrc);
-        _strokesToGreasePencilStrokes.SetBuffer(kernel, SilhouetteShaderIDs.DenseNextPointerDst, _buffers.DenseNextPointerDst);
-    }
-
-    private void BindDenseUStrokeBuffers(int kernel)
-    {
-        _strokesToGreasePencilStrokes.SetBuffer(kernel, SilhouetteShaderIDs.DenseUStrokeSrc, _buffers.DenseUStrokeSrc);
-        _strokesToGreasePencilStrokes.SetBuffer(kernel, SilhouetteShaderIDs.DenseUStrokeDst, _buffers.DenseUStrokeDst);
+        int k = _findSilhouetteEdgeKernel;
+        _silhouetteEdgeFinder.SetInt(NumFacesId, _buffers.FaceCount);
+        _silhouetteEdgeFinder.SetBuffer(k, "_Vertices", _buffers.Vertices);
+        _silhouetteEdgeFinder.SetBuffer(k, "_VertexRadiusVar", _buffers.VertexRadiusVar);
+        _silhouetteEdgeFinder.SetBuffer(k, "_Indices", _buffers.Indices);
+        _silhouetteEdgeFinder.SetBuffer(k, "_AdjIndices", _buffers.AdjIndices);
+        _silhouetteEdgeFinder.SetBuffer(k, "_outStrokes", _buffers.Strokes);
+        _silhouetteEdgeFinder.SetBuffer(k, "_outAttribs", _buffers.StrokeAttribs);
     }
 
     public void CalculateEdges()
     {
         if (!IsSetupValid()) return;
 
-        UpdateEdgeDetectionUniforms();
+        var cameraParams = StrokeCameraParams.From(viewCamera);
+        Matrix4x4 objectToWorld = transform.localToWorldMatrix;
 
-        int threadGroups = Mathf.CeilToInt(FaceCount / KERNEL_SIZE);
-        if (threadGroups > 0)
-            _silhouetteEdgeFinder.Dispatch(_findSilhouetteEdge_Kernel, threadGroups, 1, 1);
+        cameraParams.Apply(_silhouetteEdgeFinder, objectToWorld);
+        _silhouetteEdgeFinder.SetMatrix(SilhouetteShaderIDs.ObjectToWorld, objectToWorld);
+        _silhouetteEdgeFinder.SetMatrix(SilhouetteShaderIDs.ObjectToWorldIt, objectToWorld.inverse.transpose);
+        _silhouetteEdgeFinder.SetInt(SkipConcaveId, skipConcaveEdges ? 1 : 0);
+        _silhouetteEdgeFinder.SetFloat(ConcaveToleranceId, concaveTolerance);
 
-        RunEdgesToStrokePasses(threadGroups);
-        RunStrokesToGreasePencilPass(threadGroups);
+        int elementCount = _buffers.StrokeCount;
+        _silhouetteEdgeFinder.Dispatch(_findSilhouetteEdgeKernel, LineartCompute.ThreadGroups(elementCount), 1, 1);
+
+        _ranker.Run(_buffers, elementCount, LineartCompute.PointerJumpIterations(elementCount));
+
+        _denseBuilder.Build(_buffers, elementCount, cameraParams, objectToWorld, new DenseStrokeBuilder.Settings
+        {
+            radiusMultiplier = radiusMultiplier,
+            lateralShiftFactor = lateralShiftFactor,
+            lateralShiftConstant = lateralShiftConstant,
+        });
     }
 
     private bool IsSetupValid()
@@ -194,123 +102,17 @@ public class SilhouetteEdgeCalculator : MonoBehaviour, IGreasePencilEdgeCalculat
         return _sourceMesh != null && viewCamera != null && _buffers != null;
     }
 
-    private void UpdateEdgeDetectionUniforms()
-    {
-        _silhouetteEdgeFinder.SetVector(SilhouetteShaderIDs.WorldSpaceCameraPos, viewCamera.transform.position);
-
-        Matrix4x4 objectToWorld = transform.localToWorldMatrix;
-        _silhouetteEdgeFinder.SetMatrix(SilhouetteShaderIDs.ObjectToWorld, objectToWorld);
-        _silhouetteEdgeFinder.SetMatrix(SilhouetteShaderIDs.ObjectToWorldIt, objectToWorld.inverse.transpose);
-    }
-
-    void RunEdgesToStrokePasses(int threadGroups)
-    {
-        BindNextPointers(_initialize_Kernel);
-        _edgesToStrokes.Dispatch(_initialize_Kernel, threadGroups, 1, 1);
-        _buffers.SwapNextPointers();
-
-        for (int i = 0; i < NUM_POINTER_JUMP_ITERATIONS; ++i)
-        {
-            BindNextPointers(_findStrokeTail_Kernel);
-            _edgesToStrokes.Dispatch(_findStrokeTail_Kernel, threadGroups, 1, 1);
-            _buffers.SwapNextPointers();
-        }
-
-        BindNextPointers(_resetNext_Kernel);
-        _edgesToStrokes.Dispatch(_resetNext_Kernel, threadGroups, 1, 1);
-        _buffers.SwapNextPointers();
-
-        BindRankBuffers(_initRanks_Kernel);
-        _edgesToStrokes.Dispatch(_initRanks_Kernel, threadGroups, 1, 1);
-        _buffers.SwapRanks();
-
-        for (int i = 0; i < NUM_POINTER_JUMP_ITERATIONS; ++i)
-        {
-            BindNextPointers(_listRank_Kernel);
-            BindRankBuffers(_listRank_Kernel);
-            _edgesToStrokes.Dispatch(_listRank_Kernel, threadGroups, 1, 1);
-            _buffers.SwapNextPointers();
-            _buffers.SwapRanks();
-        }
-
-        BindRankBuffers(_finalizeRanks_Kernel);
-        _edgesToStrokes.Dispatch(_finalizeRanks_Kernel, threadGroups, 1, 1);
-    }
-
-    private void RunStrokesToGreasePencilPass(int threadGroups)
-    {
-        _buffers.NumStrokesCounter.SetData(new[] { 0u });
-        _buffers.NumStrokePointsCounter.SetData(new[] { 0u });
-
-        _strokesToGreasePencilStrokes.Dispatch(_setStrokeLengthAtTail_Kernel, threadGroups, 1, 1);
-        _strokesToGreasePencilStrokes.Dispatch(_calcStrokeOffsets_Kernel, threadGroups, 1, 1);
-        _strokesToGreasePencilStrokes.Dispatch(_invalidateEntries_Kernel, threadGroups, 1, 1);
-
-        Matrix4x4 view = viewCamera.worldToCameraMatrix;
-        Matrix4x4 proj = GL.GetGPUProjectionMatrix(viewCamera.projectionMatrix, true);
-        Matrix4x4 viewProj = proj * view;
-        Matrix4x4 invViewProj = viewProj.inverse;
-
-        Matrix4x4 objectToWorld = transform.localToWorldMatrix;
-        Matrix4x4 worldToObject = transform.worldToLocalMatrix;
-
-        _strokesToGreasePencilStrokes.SetMatrix(SilhouetteShaderIDs.GpObjectToWorld, objectToWorld);
-        _strokesToGreasePencilStrokes.SetMatrix(SilhouetteShaderIDs.GpWorldToObject, worldToObject);
-        _strokesToGreasePencilStrokes.SetMatrix(SilhouetteShaderIDs.GpProj, proj);
-        _strokesToGreasePencilStrokes.SetMatrix(SilhouetteShaderIDs.GpViewProj, viewProj);
-        _strokesToGreasePencilStrokes.SetMatrix(SilhouetteShaderIDs.GpInvViewProj, invViewProj);
-        _strokesToGreasePencilStrokes.SetVector(SilhouetteShaderIDs.GpScreenParams, new Vector4(viewCamera.pixelWidth, viewCamera.pixelHeight, 1.0f + 1.0f / viewCamera.pixelWidth, 1.0f + 1.0f / viewCamera.pixelHeight));
-
-        _strokesToGreasePencilStrokes.SetFloat(SilhouetteShaderIDs.RadiusMultiplier, radiusMultiplier);
-        _strokesToGreasePencilStrokes.SetFloat(SilhouetteShaderIDs.LateralShiftFactor, lateralShiftFactor);
-        _strokesToGreasePencilStrokes.SetFloat(SilhouetteShaderIDs.LateralShiftConstant, lateralShiftConstant);
-        _strokesToGreasePencilStrokes.Dispatch(_sorter_Kernel, threadGroups, 1, 1);
-
-        int denseThreadGroups = Mathf.CeilToInt((2 * FaceCount) / KERNEL_SIZE);
-        if (denseThreadGroups <= 0) return;
-
-        BindDenseNextPointers(_buildDenseNextPointers_Kernel);
-        _strokesToGreasePencilStrokes.Dispatch(_buildDenseNextPointers_Kernel, denseThreadGroups, 1, 1);
-        _buffers.SwapDenseNextPointers();
-
-        _strokesToGreasePencilStrokes.Dispatch(_offsetDenseScreenPositions_Kernel, denseThreadGroups, 1, 1);
-
-        _strokesToGreasePencilStrokes.Dispatch(_initDenseScreenDistances_Kernel, denseThreadGroups, 1, 1);
-        _buffers.SwapDenseUStrokeBuffers();
-
-        for (int i = 0; i < NUM_POINTER_JUMP_ITERATIONS; ++i)
-        {
-            BindDenseNextPointers(_densePointerJumpDistances_Kernel);
-            BindDenseUStrokeBuffers(_densePointerJumpDistances_Kernel);
-            _strokesToGreasePencilStrokes.Dispatch(_densePointerJumpDistances_Kernel, denseThreadGroups, 1, 1);
-            _buffers.SwapDenseNextPointers();
-            _buffers.SwapDenseUStrokeBuffers();
-        }
-
-        BindDenseUStrokeBuffers(_finalizeDenseScreenDistances_Kernel);
-        _strokesToGreasePencilStrokes.Dispatch(_finalizeDenseScreenDistances_Kernel, denseThreadGroups, 1, 1);
-    }
-
     void OnDestroy()
     {
         _buffers?.Dispose();
         _buffers = null;
-
-        if (_silhouetteEdgeFinder != null) Destroy(_silhouetteEdgeFinder);
-        if (_edgesToStrokes != null) Destroy(_edgesToStrokes);
-        if (_strokesToGreasePencilStrokes != null) Destroy(_strokesToGreasePencilStrokes);
+        _ranker?.Dispose();
+        _denseBuilder?.Dispose();
+        LineartCompute.Release(_silhouetteEdgeFinder);
     }
 
-    public int GetMaximumBufferLength()
-    {
-        return _buffers?.FaceCount ?? 0;
-    }
-    public GraphicsBuffer GetStrokeBuffer()
-    {
-        return _buffers?.DenseStrokes;
-    }
-    public GraphicsBuffer GetColorBuffer()
-    {
-        return _buffers?.Color;
-    }
+    public int GetMaximumBufferLength() => _buffers?.DenseCapacity ?? 0;
+    public GraphicsBuffer GetStrokeBuffer() => _buffers?.DenseStrokes;
+    public GraphicsBuffer GetColorBuffer() => _buffers?.Color;
+    public GraphicsBuffer GetStrokeAttributeBuffer() => _buffers?.DenseAttribs;
 }

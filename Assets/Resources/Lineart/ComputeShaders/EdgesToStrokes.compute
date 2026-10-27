@@ -4,6 +4,7 @@
 #pragma kernel ResetNextPointer
 #pragma kernel InitializeRanks
 #pragma kernel FinalizeRanks
+#pragma kernel SanitizeLinks
 
 #include "silhouette_defines.hh"
 #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
@@ -166,4 +167,16 @@ void FinalizeRanks(uint3 id : SV_DispatchThreadID)
     uint i = id.x;
     if (i >= _NumFaces) return;
     _strokes[i].rank = _rankSrc[i];
+}
+
+// A successor that produced no stroke element ends the chain (e.g. a neighbouring face whose contour
+// segment was rejected); without this the chain would continue through stale data.
+[numthreads(128,1,1)]
+void SanitizeLinks(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _NumFaces) return;
+    SilhouetteStrokeEdge s = _strokes[i];
+    if (IsInvalid(s) || s.adj < 0) return;
+    if (IsInvalid(_strokes[s.adj])) _strokes[i].adj = ADJ_NONE;
 }

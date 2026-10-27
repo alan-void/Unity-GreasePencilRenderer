@@ -7,71 +7,105 @@ struct VertexData
     float3 normal;
 };
 
+// world space vertex plus the per-vertex attributes interpolated onto the contour
+struct ContourVertex
+{
+    float3 position;
+    float3 normal;
+    float radiusVar;
+};
+
 #include "silhouette_defines.hh"
+#include "stroke_attributes.hh"
+#include "lineart_camera.hh"
 
 // Input Buffers
 StructuredBuffer<VertexData> _Vertices;  // All mesh vertices
+StructuredBuffer<float> _VertexRadiusVar; // baked radius variation per vertex (1 when not baked)
 StructuredBuffer<int> _Indices;         // Triangle indices (3 per triangle)
 StructuredBuffer<int> _AdjIndices;    // Adjacency info (3 indices per triangle, INVALID_UINT if none)
 
-// Output Buffer
+// Output Buffers
 RWStructuredBuffer<SilhouetteStrokeEdge> _outStrokes;
+RWStructuredBuffer<StrokePointAttributes> _outAttribs;
 
-// Uniforms (constants)
-float3 _WorldSpaceCameraPos; // Camera position, set from C#
 uint _NumFaces;              // Total number of faces (triangles)
 
-// New uniforms: object->world transform and inverse-transpose for normals
+// object->world transform and inverse-transpose for normals
 float4x4 _ObjectToWorld;
-float4x4 _ObjectToWorldIT; // inverse-transpose for normal transform
+float4x4 _ObjectToWorldIT;
 
-// Helper function to find the zero-crossing point on an edge
-// This is identical to your provided logic.
-bool TryGetZeroPoint(VertexData v1, VertexData v2, out float3 zeroPoint)
+// Blender "Skip Concave Edges": drop contour segments on folds where the surface turns away from the view
+uint _SkipConcave;
+float _ConcaveTolerance;
+
+// g = N . V with the un-normalized view vector (matches Blender's Silhouette Edges • Smooth)
+float ContourValue(ContourVertex v)
 {
-    // We need to find the interpolation factor 't' such that
-    // lerp(vA.scalar, vB.scalar, t) == 0
-    //
-    // sA * (1-t) + sB * t = 0
-    // sA - sA*t + sB*t = 0
-    // sA = t * (sA - sB)
-    // t = sA / (sA - sB)
-    
-    float3 dirToCam1 = normalize(_WorldSpaceCameraPos - v1.position);
-    float3 dirToCam2 = normalize(_WorldSpaceCameraPos - v2.position);
+    return dot(v.normal, ViewVector(v.position));
+}
 
-    float dot1 = dot(v1.normal, dirToCam1);
-    float dot2 = dot(v2.normal, dirToCam2);
-    
-    // If dots have the same sign, no silhouette edge crosses this segment
-    if (dot1 * dot2 > 0.0f)
+// Finds the zero crossing of N.V along the edge v1 -> v2
+bool TryGetZeroPoint(ContourVertex v1, ContourVertex v2, out ContourVertex zeroPoint)
+{
+    float g1 = ContourValue(v1);
+    float g2 = ContourValue(v2);
+
+    zeroPoint = v1;
+
+    // If values have the same sign, no silhouette edge crosses this segment
+    if ((g1 > 0.0f) == (g2 > 0.0f))
     {
-        zeroPoint = float3(0, 0, 0);
-        return false;
-    }
-    
-    // Avoid division by zero, though this case (dot1 == dot2)
-    // should be filtered out by the (dot1 * dot2 > 0) check.
-    float denom = dot1 - dot2;
-    if (abs(denom) < 0.00001f)
-    {
-        zeroPoint = float3(0, 0, 0);
         return false;
     }
 
-    float t = dot1 / denom;
+    float denom = g1 - g2;
+    if (abs(denom) < 1e-8f)
+    {
+        return false;
+    }
 
-    // Linearly interpolate the world-space positions
-    zeroPoint = lerp(v1.position, v2.position, t);
+    float t = g1 / denom;
+    zeroPoint.position = lerp(v1.position, v2.position, t);
+    float3 n = lerp(v1.normal, v2.normal, t);
+    zeroPoint.normal = dot(n, n) > 1e-12f ? normalize(n) : v1.normal;
+    zeroPoint.radiusVar = lerp(v1.radiusVar, v2.radiusVar, t);
     return true;
 }
 
-bool TryGetZeroLine(VertexData v0, VertexData v1, VertexData v2, uint faceIdx)
+// Fold test of Blender's Silhouette Edges • Smooth: K < -tolerance marks a concave fold
+bool IsConcaveFold(ContourVertex v0, ContourVertex v1, ContourVertex v2)
+{
+    float3 e1 = v1.position - v0.position;
+    float3 e2 = v2.position - v0.position;
+    float3 n = cross(e1, e2);
+    float nLen = length(n);
+    if (nLen < 1e-12f) return false;
+
+    float g0 = ContourValue(v0);
+    float g1 = ContourValue(v1);
+    float g2 = ContourValue(v2);
+
+    float3 v = ViewVector((v0.position + v1.position + v2.position) / 3.0f);
+    float vLen = length(v);
+    if (vLen < 1e-12f) return false;
+
+    float3 gradDir = (g1 - g0) * cross(e2, n) + (g2 - g0) * cross(n, e1);
+    float k = dot(gradDir, v / vLen) / (pow(nLen, 1.5f) * vLen);
+    return k < -_ConcaveTolerance;
+}
+
+bool IsFrontFacing(ContourVertex v)
+{
+    return ContourValue(v) > 0.0f;
+}
+
+bool TryGetZeroLine(ContourVertex v0, ContourVertex v1, ContourVertex v2, uint faceIdx)
 {
     int points_found = 0;
-    float3 zeroPoint;
+    ContourVertex zeroPoint;
 
-    float3 tmpPoints[2];
+    ContourVertex tmpPoints[2];
     int  tmpAdj[2];
     int   tmpEdgeIdx[2];
 
@@ -83,7 +117,7 @@ bool TryGetZeroLine(VertexData v0, VertexData v1, VertexData v2, uint faceIdx)
         tmpEdgeIdx[points_found] = 0;
         points_found++;
     }
-    
+
     // Check edge v1-v2  (edge index 1)
     if (TryGetZeroPoint(v1, v2, zeroPoint))
     {
@@ -92,9 +126,9 @@ bool TryGetZeroLine(VertexData v0, VertexData v1, VertexData v2, uint faceIdx)
         tmpEdgeIdx[points_found] = 1;
         points_found++;
     }
-    
+
     // Check edge v2-v0  (edge index 2)
-    if (TryGetZeroPoint(v2, v0, zeroPoint))
+    if (points_found < 2 && TryGetZeroPoint(v2, v0, zeroPoint))
     {
         tmpPoints[points_found] = zeroPoint;
         tmpAdj[points_found] = _AdjIndices[faceIdx * 3 + 2];
@@ -102,62 +136,73 @@ bool TryGetZeroLine(VertexData v0, VertexData v1, VertexData v2, uint faceIdx)
         points_found++;
     }
     _outStrokes[faceIdx].minPoint = points_found;
-    // If we found exactly two points, a valid silhouette line segment
-    // crosses this triangle.
-    if (points_found == 2)
+
+    if (points_found != 2)
     {
-        bool flip = false;
-
-        if (tmpEdgeIdx[0] == 0 && tmpEdgeIdx[1] == 2)
-        {
-            flip = true;
-        }
-        
-        if (tmpEdgeIdx[0] == 0 && tmpEdgeIdx[1] == 1)
-        {
-            if (dot(v2.normal, normalize(_WorldSpaceCameraPos - v2.position)) > 0.0f)
-            {
-                flip = !flip;
-            }
-        }
-        else if (tmpEdgeIdx[0] == 1 && tmpEdgeIdx[1] == 2)
-        {
-            if (dot(v0.normal, normalize(_WorldSpaceCameraPos - v0.position)) > 0.0f)
-            {
-                flip = !flip;
-            }
-        }
-        else if (tmpEdgeIdx[0] == 0 && tmpEdgeIdx[1] == 2)
-        {
-            if (dot(v1.normal, normalize(_WorldSpaceCameraPos - v1.position)) > 0.0f)
-            {
-                flip = !flip;
-            }
-        }
-        
-        // Ensure winding is consistent with original faces
-        if (flip)
-        {
-            _outStrokes[faceIdx].pos = tmpPoints[1];
-            _outStrokes[faceIdx].adj = tmpAdj[1];
-        }
-        else
-        {
-            _outStrokes[faceIdx].pos = tmpPoints[0];
-            _outStrokes[faceIdx].adj = tmpAdj[0];
-        }
-
-        _outStrokes[faceIdx].flags &= !STROKE_FLAG_IS_INVALID;
-        return true;
+        return false;
     }
-    
-    return false;
+
+    if (_SkipConcave != 0 && IsConcaveFold(v0, v1, v2))
+    {
+        return false;
+    }
+
+    // A valid silhouette line segment crosses this triangle.
+    bool flip = false;
+
+    if (tmpEdgeIdx[0] == 0 && tmpEdgeIdx[1] == 2)
+    {
+        flip = true;
+    }
+
+    if (tmpEdgeIdx[0] == 0 && tmpEdgeIdx[1] == 1)
+    {
+        if (IsFrontFacing(v2))
+        {
+            flip = !flip;
+        }
+    }
+    else if (tmpEdgeIdx[0] == 1 && tmpEdgeIdx[1] == 2)
+    {
+        if (IsFrontFacing(v0))
+        {
+            flip = !flip;
+        }
+    }
+    else if (tmpEdgeIdx[0] == 0 && tmpEdgeIdx[1] == 2)
+    {
+        if (IsFrontFacing(v1))
+        {
+            flip = !flip;
+        }
+    }
+
+    // Ensure winding is consistent with original faces
+    ContourVertex p = tmpPoints[0];
+    if (flip) p = tmpPoints[1];
+    _outStrokes[faceIdx].pos = p.position;
+    _outStrokes[faceIdx].adj = flip ? tmpAdj[1] : tmpAdj[0];
+    _outStrokes[faceIdx].flags = 0;
+
+    StrokePointAttributes attribs = DefaultStrokePointAttributes(p.normal);
+    attribs.radiusVar = p.radiusVar;
+    _outAttribs[faceIdx] = attribs;
+    return true;
 }
 
+ContourVertex LoadWorldVertex(uint index)
+{
+    VertexData v = _Vertices[index];
+    ContourVertex w;
+    w.position = mul(_ObjectToWorld, float4(v.position, 1.0)).xyz;
+    w.normal = normalize(mul((float3x3)_ObjectToWorldIT, v.normal));
+    w.radiusVar = _VertexRadiusVar[index];
+    return w;
+}
 
 // for each input face (triangle), a line is generated if it contains a silhouette edge
 // input is triangle list with adjacency info
-// output is one StrokeData per triangle (valid is set only if a silhoutte line was found)
+// output is one StrokeData per triangle (valid is set only if a silhouette line was found)
 [numthreads(128, 1, 1)]
 void FindSilhouetteEdge(uint3 id : SV_DispatchThreadID)
 {
@@ -169,39 +214,12 @@ void FindSilhouetteEdge(uint3 id : SV_DispatchThreadID)
     }
     _outStrokes[faceIdx].flags = STROKE_FLAG_IS_INVALID;
 
-    // --- 1. Fetch Triangle Indices ---
-    uint i0 = (uint)_Indices[faceIdx * 3 + 0];
-    uint i1 = (uint)_Indices[faceIdx * 3 + 1];
-    uint i2 = (uint)_Indices[faceIdx * 3 + 2];
+    ContourVertex w0 = LoadWorldVertex((uint)_Indices[faceIdx * 3 + 0]);
+    ContourVertex w1 = LoadWorldVertex((uint)_Indices[faceIdx * 3 + 1]);
+    ContourVertex w2 = LoadWorldVertex((uint)_Indices[faceIdx * 3 + 2]);
 
-    // --- 2. Fetch Vertex Data ---
-    // Note: If vertices are shared, this will fetch the same vertex
-    // multiple times across different threads, which is fine.
-    VertexData v0 = _Vertices[i0];
-    VertexData v1 = _Vertices[i1];
-    VertexData v2 = _Vertices[i2];
-
-    // --- Transform to world space using provided object matrices ---
-    VertexData w0;
-    VertexData w1;
-    VertexData w2;
-
-    // transform positions (float4 mul) and normals (inverse-transpose 3x3)
-    w0.position = mul(_ObjectToWorld, float4(v0.position, 1.0)).xyz;
-    w1.position = mul(_ObjectToWorld, float4(v1.position, 1.0)).xyz;
-    w2.position = mul(_ObjectToWorld, float4(v2.position, 1.0)).xyz;
-
-    float3x3 nit = (float3x3)_ObjectToWorldIT;
-    w0.normal = normalize(mul(nit, v0.normal));
-    w1.normal = normalize(mul(nit, v1.normal));
-    w2.normal = normalize(mul(nit, v2.normal));
-
-    // --- 3. Run Silhouette Logic on world-space vertices ---
-    // This function will write the result directly to
-    // _outStrokes[faceIdx]
     TryGetZeroLine(w0, w1, w2, faceIdx);
 
-    // --- 4. Compute and store face normal (world space) ---
     float3 fn = normalize(cross(w1.position - w0.position, w2.position - w0.position));
     _outStrokes[faceIdx].faceNormal = fn;
 }

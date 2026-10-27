@@ -1,212 +1,162 @@
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using Lineart.Pipeline;
 using UnityEngine;
 
+/// <summary>
+/// Owns every GPU buffer used by a silhouette edge calculator: the optional source mesh buffers, the
+/// per-element stroke chain buffers (ping-pong pairs for pointer jumping) and the dense Grease Pencil
+/// point arrays the renderer draws from.
+/// </summary>
 public sealed class SilhouetteBufferContext : IDisposable
 {
-    public int StrokeCount { get; }
-    public int FaceCount { get; }
-    public int DenseCapacity { get; }
+    /// <summary>Number of stroke elements (faces, corners or half-edges depending on the edge finder).</summary>
+    public int StrokeCount { get; private set; }
+    public int FaceCount { get; private set; }
+    public int DenseCapacity { get; private set; }
 
-    public ComputeBuffer Vertices { get; }
-    public ComputeBuffer Indices { get; }
-    public ComputeBuffer AdjIndices { get; }
-    public ComputeBuffer Strokes { get; }
+    // Source mesh (only for mesh based finders)
+    public ComputeBuffer Vertices { get; private set; }
+    public ComputeBuffer VertexRadiusVar { get; private set; }
+    public ComputeBuffer Indices { get; private set; }
+    public ComputeBuffer AdjIndices { get; private set; }
 
+    // Per stroke element
+    public ComputeBuffer Strokes { get; private set; }
+    public ComputeBuffer StrokeAttribs { get; private set; }
     public ComputeBuffer NextPointerSrc { get; private set; }
     public ComputeBuffer NextPointerDst { get; private set; }
     public ComputeBuffer RankSrc { get; private set; }
     public ComputeBuffer RankDst { get; private set; }
 
+    // Dense Grease Pencil layout
     public ComputeBuffer DenseNextPointerSrc { get; private set; }
     public ComputeBuffer DenseNextPointerDst { get; private set; }
     public ComputeBuffer DenseUStrokeSrc { get; private set; }
     public ComputeBuffer DenseUStrokeDst { get; private set; }
 
-    public ComputeBuffer NumStrokesCounter { get; }
-    public ComputeBuffer NumStrokePointsCounter { get; }
+    public ComputeBuffer NumStrokesCounter { get; private set; }
+    public ComputeBuffer NumStrokePointsCounter { get; private set; }
 
-    public GraphicsBuffer DenseStrokes { get; }
-    public GraphicsBuffer Color { get; }
+    public GraphicsBuffer DenseStrokes { get; private set; }
+    public GraphicsBuffer DenseAttribs { get; private set; }
+    public GraphicsBuffer Color { get; private set; }
 
-    private SilhouetteBufferContext(
-        int strokeCount,
-        int faceCount,
-        int denseCapacity,
-        ComputeBuffer vertices,
-        ComputeBuffer indices,
-        ComputeBuffer adjIndices,
-        ComputeBuffer strokes,
-        ComputeBuffer nextPointerSrc,
-        ComputeBuffer nextPointerDst,
-        ComputeBuffer rankSrc,
-        ComputeBuffer rankDst,
-        ComputeBuffer denseNextPointerSrc,
-        ComputeBuffer denseNextPointerDst,
-        ComputeBuffer denseUStrokeSrc,
-        ComputeBuffer denseUStrokeDst,
-        ComputeBuffer numStrokesCounter,
-        ComputeBuffer numStrokePointsCounter,
-        GraphicsBuffer denseStrokes,
-        GraphicsBuffer color)
-    {
-        StrokeCount = strokeCount;
-        FaceCount = faceCount;
-        DenseCapacity = denseCapacity;
+    private SilhouetteBufferContext() { }
 
-        Vertices = vertices;
-        Indices = indices;
-        AdjIndices = adjIndices;
-        Strokes = strokes;
-
-        NextPointerSrc = nextPointerSrc;
-        NextPointerDst = nextPointerDst;
-        RankSrc = rankSrc;
-        RankDst = rankDst;
-
-        DenseNextPointerSrc = denseNextPointerSrc;
-        DenseNextPointerDst = denseNextPointerDst;
-        DenseUStrokeSrc = denseUStrokeSrc;
-        DenseUStrokeDst = denseUStrokeDst;
-
-        NumStrokesCounter = numStrokesCounter;
-        NumStrokePointsCounter = numStrokePointsCounter;
-
-        DenseStrokes = denseStrokes;
-        Color = color;
-    }
-
+    /// <summary>Buffers for a finder that produces one stroke element per triangle corner.</summary>
     public static SilhouetteBufferContext CreateForSharp(Mesh mesh)
     {
         if (mesh == null) throw new ArgumentNullException(nameof(mesh));
 
-        int cornerCount = mesh.triangles.Length;
-        int faceCount = mesh.triangles.Length / 3;
-        int denseCapacity = cornerCount;
-
-        Vector3[] positions = mesh.vertices;
-        Vector3[] normals = mesh.normals;
-        var vertexDataArray = new SilhouetteSourceVertex[positions.Length];
-        for (int i = 0; i < positions.Length; i++)
-        {
-            vertexDataArray[i] = new SilhouetteSourceVertex { position = positions[i], normal = normals[i] };
-        }
-
-        var verticesBuffer = new ComputeBuffer(vertexDataArray.Length, Marshal.SizeOf(typeof(SilhouetteSourceVertex)));
-        verticesBuffer.SetData(vertexDataArray);
-
         int[] indices = mesh.triangles;
-        var indicesBuffer = new ComputeBuffer(indices.Length, sizeof(int));
-        indicesBuffer.SetData(indices);
+        int cornerCount = indices.Length;
 
-        int[] adjData = SilhouetteMeshUtility.CalculateCornerAdjacency(indices, positions);
-        var adjIndicesBuffer = new ComputeBuffer(adjData.Length, sizeof(uint));
-        adjIndicesBuffer.SetData(adjData);
-
-        var strokesBuffer = new ComputeBuffer(cornerCount, SilhouetteStrokeEdge.SizeOf);
-
-        var nextPointerSrcBuffer = new ComputeBuffer(cornerCount, sizeof(int));
-        var nextPointerDstBuffer = new ComputeBuffer(cornerCount, sizeof(int));
-        var rankSrcBuffer = new ComputeBuffer(cornerCount, sizeof(uint));
-        var rankDstBuffer = new ComputeBuffer(cornerCount, sizeof(uint));
-
-        var denseStrokesBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, denseCapacity, GreasePencilRenderer.GreasePencilStrokeVert.SizeOf);
-        var colorBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, denseCapacity, GreasePencilRenderer.GreasePencilColorVert.SizeOf);
-
-        var numStrokesCounterBuffer = new ComputeBuffer(1, sizeof(uint));
-        var numStrokePointsCounterBuffer = new ComputeBuffer(1, sizeof(uint));
-
-        var denseNextPointerSrcBuffer = new ComputeBuffer(denseCapacity, sizeof(int));
-        var denseNextPointerDstBuffer = new ComputeBuffer(denseCapacity, sizeof(int));
-        var denseUStrokeSrcBuffer = new ComputeBuffer(denseCapacity, sizeof(float));
-        var denseUStrokeDstBuffer = new ComputeBuffer(denseCapacity, sizeof(float));
-
-        return new SilhouetteBufferContext(
-            cornerCount,
-            faceCount,
-            denseCapacity,
-            verticesBuffer,
-            indicesBuffer,
-            adjIndicesBuffer,
-            strokesBuffer,
-            nextPointerSrcBuffer,
-            nextPointerDstBuffer,
-            rankSrcBuffer,
-            rankDstBuffer,
-            denseNextPointerSrcBuffer,
-            denseNextPointerDstBuffer,
-            denseUStrokeSrcBuffer,
-            denseUStrokeDstBuffer,
-            numStrokesCounterBuffer,
-            numStrokePointsCounterBuffer,
-            denseStrokesBuffer,
-            colorBuffer);
+        var ctx = new SilhouetteBufferContext { FaceCount = cornerCount / 3 };
+        ctx.UploadMesh(mesh, indices, SilhouetteMeshUtility.CalculateCornerAdjacency(indices, mesh.vertices));
+        ctx.AllocateStrokeBuffers(cornerCount, cornerCount);
+        return ctx;
     }
 
+    /// <summary>Buffers for a finder that produces one stroke element per triangle.</summary>
     public static SilhouetteBufferContext CreateForSmooth(Mesh mesh)
     {
         if (mesh == null) throw new ArgumentNullException(nameof(mesh));
 
-        int faceCount = mesh.triangles.Length / 3;
-        int denseCapacity = 2 * faceCount;
+        int[] indices = mesh.triangles;
+        int faceCount = indices.Length / 3;
 
+        var ctx = new SilhouetteBufferContext { FaceCount = faceCount };
+        ctx.UploadMesh(mesh, indices, SilhouetteMeshUtility.CalculateAdjacency(indices, mesh.vertices));
+        ctx.AllocateStrokeBuffers(faceCount, 2 * faceCount);
+        return ctx;
+    }
+
+    /// <summary>Stroke chain + dense buffers only; the caller owns its own source buffers.</summary>
+    public static SilhouetteBufferContext CreateForElements(int elementCount, int denseCapacity)
+    {
+        var ctx = new SilhouetteBufferContext();
+        ctx.AllocateStrokeBuffers(elementCount, denseCapacity);
+        return ctx;
+    }
+
+    private void UploadMesh(Mesh mesh, int[] indices, int[] adjacency)
+    {
         Vector3[] positions = mesh.vertices;
-        Vector3[] normals = mesh.normals;
-        var vertexDataArray = new SilhouetteSourceVertex[positions.Length];
+        // contours follow the smooth line normals when the mesh carries them (shading normals may be split)
+        Vector3[] normals = MeshStreams.ReadLineNormals(mesh);
+        var vertexData = new SilhouetteSourceVertex[positions.Length];
         for (int i = 0; i < positions.Length; i++)
         {
-            vertexDataArray[i] = new SilhouetteSourceVertex { position = positions[i], normal = normals[i] };
+            vertexData[i] = new SilhouetteSourceVertex { position = positions[i], normal = normals[i] };
         }
 
-        var verticesBuffer = new ComputeBuffer(vertexDataArray.Length, Marshal.SizeOf(typeof(SilhouetteSourceVertex)));
-        verticesBuffer.SetData(vertexDataArray);
+        Vertices = new ComputeBuffer(vertexData.Length, Marshal.SizeOf(typeof(SilhouetteSourceVertex)));
+        Vertices.SetData(vertexData);
 
-        int[] indices = mesh.triangles;
-        var indicesBuffer = new ComputeBuffer(indices.Length, sizeof(int));
-        indicesBuffer.SetData(indices);
+        VertexRadiusVar = new ComputeBuffer(Mathf.Max(1, positions.Length), sizeof(float));
+        VertexRadiusVar.SetData(ReadRadiusVariation(mesh, positions.Length));
 
-        int[] adjData = SilhouetteMeshUtility.CalculateAdjacency(indices, positions);
-        var adjIndicesBuffer = new ComputeBuffer(adjData.Length, sizeof(uint));
-        adjIndicesBuffer.SetData(adjData);
+        Indices = new ComputeBuffer(indices.Length, sizeof(int));
+        Indices.SetData(indices);
 
-        var strokesBuffer = new ComputeBuffer(faceCount, SilhouetteStrokeEdge.SizeOf);
+        AdjIndices = new ComputeBuffer(adjacency.Length, sizeof(int));
+        AdjIndices.SetData(adjacency);
+    }
 
-        var nextPointerSrcBuffer = new ComputeBuffer(faceCount, sizeof(int));
-        var nextPointerDstBuffer = new ComputeBuffer(faceCount, sizeof(int));
-        var rankSrcBuffer = new ComputeBuffer(faceCount, sizeof(uint));
-        var rankDstBuffer = new ComputeBuffer(faceCount, sizeof(uint));
+    /// <summary>Baked radius variation lives in uv2.x (see MeshStreams); defaults to 1.</summary>
+    private static float[] ReadRadiusVariation(Mesh mesh, int vertexCount)
+    {
+        var result = new float[Mathf.Max(1, vertexCount)];
+        for (int i = 0; i < result.Length; i++) result[i] = 1.0f;
 
-        var denseStrokesBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, denseCapacity, GreasePencilRenderer.GreasePencilStrokeVert.SizeOf);
-        var colorBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, denseCapacity, GreasePencilRenderer.GreasePencilColorVert.SizeOf);
+        if (!mesh.HasVertexAttribute(UnityEngine.Rendering.VertexAttribute.TexCoord2)) return result;
 
-        var numStrokesCounterBuffer = new ComputeBuffer(1, sizeof(uint));
-        var numStrokePointsCounterBuffer = new ComputeBuffer(1, sizeof(uint));
+        var uvs = new List<Vector2>(vertexCount);
+        mesh.GetUVs(MeshStreams.RadiusVariationChannel, uvs);
+        for (int i = 0; i < uvs.Count && i < result.Length; i++) result[i] = uvs[i].x;
+        return result;
+    }
 
-        var denseNextPointerSrcBuffer = new ComputeBuffer(denseCapacity, sizeof(int));
-        var denseNextPointerDstBuffer = new ComputeBuffer(denseCapacity, sizeof(int));
-        var denseUStrokeSrcBuffer = new ComputeBuffer(denseCapacity, sizeof(float));
-        var denseUStrokeDstBuffer = new ComputeBuffer(denseCapacity, sizeof(float));
+    private void AllocateStrokeBuffers(int elementCount, int denseCapacity)
+    {
+        StrokeCount = elementCount;
+        DenseCapacity = denseCapacity;
 
-        return new SilhouetteBufferContext(
-            faceCount,
-            faceCount,
-            denseCapacity,
-            verticesBuffer,
-            indicesBuffer,
-            adjIndicesBuffer,
-            strokesBuffer,
-            nextPointerSrcBuffer,
-            nextPointerDstBuffer,
-            rankSrcBuffer,
-            rankDstBuffer,
-            denseNextPointerSrcBuffer,
-            denseNextPointerDstBuffer,
-            denseUStrokeSrcBuffer,
-            denseUStrokeDstBuffer,
-            numStrokesCounterBuffer,
-            numStrokePointsCounterBuffer,
-            denseStrokesBuffer,
-            colorBuffer);
+        int elements = Mathf.Max(1, elementCount);
+        int dense = Mathf.Max(1, denseCapacity);
+
+        Strokes = new ComputeBuffer(elements, SilhouetteStrokeEdge.SizeOf);
+        StrokeAttribs = new ComputeBuffer(elements, StrokePointAttributes.SizeOf);
+        StrokeAttribs.SetData(DefaultAttributes(elements));
+        NextPointerSrc = new ComputeBuffer(elements, sizeof(int));
+        NextPointerDst = new ComputeBuffer(elements, sizeof(int));
+        RankSrc = new ComputeBuffer(elements, sizeof(uint));
+        RankDst = new ComputeBuffer(elements, sizeof(uint));
+
+        DenseStrokes = new GraphicsBuffer(GraphicsBuffer.Target.Structured, dense, GreasePencilRenderer.GreasePencilStrokeVert.SizeOf);
+        DenseAttribs = new GraphicsBuffer(GraphicsBuffer.Target.Structured, dense, StrokePointAttributes.SizeOf);
+        Color = new GraphicsBuffer(GraphicsBuffer.Target.Structured, dense, GreasePencilRenderer.GreasePencilColorVert.SizeOf);
+
+        DenseNextPointerSrc = new ComputeBuffer(dense, sizeof(int));
+        DenseNextPointerDst = new ComputeBuffer(dense, sizeof(int));
+        DenseUStrokeSrc = new ComputeBuffer(dense, sizeof(float));
+        DenseUStrokeDst = new ComputeBuffer(dense, sizeof(float));
+
+        NumStrokesCounter = new ComputeBuffer(1, sizeof(uint));
+        NumStrokePointsCounter = new ComputeBuffer(1, sizeof(uint));
+    }
+
+    /// <summary>Finders that don't write attributes (e.g. the sharp finder) keep these neutral values.</summary>
+    private static StrokePointAttributes[] DefaultAttributes(int count)
+    {
+        var attribs = new StrokePointAttributes[count];
+        for (int i = 0; i < count; i++)
+        {
+            attribs[i] = new StrokePointAttributes { weight = 1f, miter = 1f, radiusVar = 1f, meanWeight = 1f };
+        }
+        return attribs;
     }
 
     public void SwapNextPointers()
@@ -232,9 +182,11 @@ public sealed class SilhouetteBufferContext : IDisposable
     public void Dispose()
     {
         Vertices?.Release();
+        VertexRadiusVar?.Release();
         Indices?.Release();
         AdjIndices?.Release();
         Strokes?.Release();
+        StrokeAttribs?.Release();
         NextPointerSrc?.Release();
         NextPointerDst?.Release();
         RankSrc?.Release();
@@ -246,6 +198,7 @@ public sealed class SilhouetteBufferContext : IDisposable
         NumStrokesCounter?.Release();
         NumStrokePointsCounter?.Release();
         DenseStrokes?.Release();
+        DenseAttribs?.Release();
         Color?.Release();
     }
 }

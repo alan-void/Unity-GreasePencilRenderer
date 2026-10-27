@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using DefaultNamespace;
+using Lineart.Pipeline;
 using UnityEngine;
 using Unity.Profiling;
 using UnityEngine.Rendering;
@@ -21,6 +22,8 @@ public class SilhouetteRenderer : MonoBehaviour
 	}
     
     IGreasePencilEdgeCalculator _edgeCalculator;
+    IStrokePostProcessor[] _postProcessors;
+    Renderer _sourceRenderer;
     
     GraphicsBuffer _indices;
     ComputeBuffer _materialBuffer;
@@ -32,17 +35,27 @@ public class SilhouetteRenderer : MonoBehaviour
     
     [Range(0.0f, 1.0f)] public float opacity = 1.0f;
     public Color colorTint = new(1, 1, 1, 0);
+    [Tooltip("World units added around the source renderer bounds for culling.")]
+    public float boundsPadding = 1.0f;
     
     
     void Start()
     {
         _edgeCalculator = GetComponent<IGreasePencilEdgeCalculator>();
+        _postProcessors = GetComponents<IStrokePostProcessor>();
+        _sourceRenderer = GetComponent<Renderer>();
         InitBuffers();
     }
 
     private void Update()
     {
+        if (_edgeCalculator.GetStrokeBuffer() == null) return;
+
         _edgeCalculator.CalculateEdges();
+        foreach (var postProcessor in _postProcessors)
+        {
+            if (postProcessor.isActiveAndEnabled) postProcessor.Process(_edgeCalculator);
+        }
         // Create the MaterialPropertyBlock to hold our per-draw data.
         var matProps = new MaterialPropertyBlock();
 
@@ -60,10 +73,19 @@ public class SilhouetteRenderer : MonoBehaviour
     
         
         RenderParams rp = new RenderParams(material);
-        rp.worldBounds = new Bounds(Vector3.zero, 1000*Vector3.one); // use tighter bounds
+        rp.worldBounds = StrokeBounds();
         rp.matProps = matProps;
         
         Graphics.RenderPrimitivesIndexed(rp, MeshTopology.Triangles, _indices, _indices.count);
+    }
+
+    // Strokes stay close to the source surface; pad the source bounds for pushed / thick strokes.
+    Bounds StrokeBounds()
+    {
+        if (_sourceRenderer == null) return new Bounds(Vector3.zero, 1000 * Vector3.one);
+        Bounds bounds = _sourceRenderer.bounds;
+        bounds.Expand(boundsPadding);
+        return bounds;
     }
 
     void OnDestroy()
@@ -75,6 +97,8 @@ public class SilhouetteRenderer : MonoBehaviour
     {
         _indices?.Dispose();
         _indices = null;
+        _materialBuffer?.Release();
+        _materialBuffer = null;
     }
 
     void InitBuffers()

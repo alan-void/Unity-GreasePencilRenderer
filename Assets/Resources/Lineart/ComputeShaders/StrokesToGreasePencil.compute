@@ -9,20 +9,26 @@
 #pragma kernel FinalizeDenseScreenDistances
 
 #include "silhouette_defines.hh"
+#include "stroke_attributes.hh"
+#include "lineart_camera.hh"
 #include "Assets/Resources/GreasePencil/gpencil_info.hh"
 #include "Assets/Resources/GreasePencil/gpencil_defines.hh"
 #include "Assets/Resources/GreasePencil/draw_grease_pencil_lib.hlsl"
 
 RWStructuredBuffer<SilhouetteStrokeEdge> _strokes;
+StructuredBuffer<StrokePointAttributes> _strokeAttribs;
 
-//Todo: rename to domain size(this num verts in sharp edge case)
+// number of stroke elements (faces / corners / half-edges depending on the edge finder)
 uint _NumFaces;
+// capacity of the dense point arrays
+uint _DenseCount;
 
 RWStructuredBuffer<uint> numStrokesCounter;
 RWStructuredBuffer<uint> numStrokePointsCounter;
 
 RWStructuredBuffer<GreasePencilStrokeVert> _denseArray;
 RWStructuredBuffer<GreasePencilColorVert> _colorArray;
+RWStructuredBuffer<StrokePointAttributes> _denseAttribs;
 
 StructuredBuffer<int> _denseNextPointerSrc;
 RWStructuredBuffer<int> _denseNextPointerDst;
@@ -30,52 +36,11 @@ RWStructuredBuffer<int> _denseNextPointerDst;
 StructuredBuffer<float> _denseUStrokeSrc;
 RWStructuredBuffer<float> _denseUStrokeDst;
 
-float4x4 _GP_ObjectToWorld;
-float4x4 _GP_WorldToObject;
-float4x4 _GP_Proj;
-float4x4 _GP_ViewProj;
-float4x4 _GP_InvViewProj;
-float4 _GP_ScreenParams;
-
 float _radiusMultiplier = 1.0f;
 float _LateralShiftFactor = 0.0f;
 float _LateralShiftConstant = 0.0f;
 
-float2 ProjectToScreen(float3 worldPos)
-{
-    float4 clip = mul(_GP_ViewProj, float4(worldPos, 1.0f));
-    return ((clip.xy / clip.w) * 0.5f + 0.5f) * _GP_ScreenParams.xy;
-}
-
-float2 PixelToNdcXY(float2 pixel)
-{
-    return (pixel / _GP_ScreenParams.xy) * 2.0f - 1.0f;
-}
-
-float3 UnprojectWorldFromNdc(float2 ndcXY, float ndcZ)
-{
-    float4 worldH = mul(_GP_InvViewProj, float4(ndcXY, ndcZ, 1.0f));
-    return worldH.xyz / max(worldH.w, 1e-8f);
-}
-
-float3 ScreenPixelOffsetToWorldDelta(float3 worldPos, float2 pixelOffset)
-{
-    float4 clip = mul(_GP_ViewProj, float4(worldPos, 1.0f));
-    if (abs(clip.w) <= 1e-8f)
-    {
-        return float3(0.0f, 0.0f, 0.0f);
-    }
-
-    float2 basePixel = ((clip.xy / clip.w) * 0.5f + 0.5f) * _GP_ScreenParams.xy;
-    float ndcZ = clip.z / clip.w;
-
-    float2 ndc0 = PixelToNdcXY(basePixel);
-    float2 ndc1 = PixelToNdcXY(basePixel + pixelOffset);
-
-    float3 world0 = UnprojectWorldFromNdc(ndc0, ndcZ);
-    float3 world1 = UnprojectWorldFromNdc(ndc1, ndcZ);
-    return world1 - world0;
-}
+#include "dense_stroke_lib.hh"
 
 float stroke_radius_modulate(float radius)
 {
@@ -124,60 +89,11 @@ void CalculateArrayOffsets(uint3 id : SV_DispatchThreadID)
 void InvalidateEntries(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
+    if (i >= _DenseCount) return;
     _denseArray[i].mat = -1;
     _denseArray[i].uv_fill = float2(-1,-1);
 }
     
-
-uint unit_float_to_uchar_clamp(float val)
-{
-    return (uint)round(saturate(val) * 255.0);
-}
-
-uint pack_rotation_aspect_hardness_miter(
-    const float rot,
-    const float asp,
-    const float softness,
-    const float miter_angle)
-{
-    uint packed = 0;
-    /* Aspect uses 9 bits */
-    float asp_normalized = (asp > 1.0f) ? (1.0f / asp) : asp;
-    /* Use the default aspect ratio of 1 when the value is outside of the valid range. */
-    if (asp_normalized <= 0.0f) {
-        asp_normalized = 1.0f;
-    }
-    packed |= uint(unit_float_to_uchar_clamp(asp_normalized));
-    /* Store if inverted in the 9th bit. */
-    if (asp > 1.0f) {
-        packed |= 1 << 8;
-    }
-    /* Rotation uses 9 bits */
-    /* Rotation are in [-90..90] degree range, so we can encode the sign of the angle + the cosine
-     * because the cosine will always be positive. */
-    packed |= unit_float_to_uchar_clamp(cos(rot)) << 9;
-    /* Store sine sign in 9th bit. */
-    if (rot < 0.0f) {
-        packed |= 1 << 17;
-    }
-    /* Hardness uses 8 bits */
-    packed |= unit_float_to_uchar_clamp(1.0f - softness) << 18;
-    
-
-    /* Miter Angle uses the last 6 bits */
-    if (miter_angle <= GP_STROKE_MITER_ANGLE_ROUND) {
-        packed |= GP_CORNER_TYPE_ROUND_BITS << 26;
-    }
-    else if (miter_angle >= GP_STROKE_MITER_ANGLE_BEVEL) {
-        packed |= GP_CORNER_TYPE_BEVEL_BITS << 26;
-    }
-    else {
-        const float miter_norm = (miter_angle / PI);
-        packed |= clamp(int(miter_norm * GP_CORNER_TYPE_MITER_NUMBER), 1, GP_CORNER_TYPE_MITER_NUMBER) << 26;
-    }
-
-    return packed;
-}
 
 [numthreads(128,1,1)]
 void MoveToDenseArray(uint3 id : SV_DispatchThreadID)
@@ -212,6 +128,10 @@ void MoveToDenseArray(uint3 id : SV_DispatchThreadID)
 
     _colorArray[globalOffset] = gpColor;
 
+    StrokePointAttributes attribs = _strokeAttribs[i];
+    attribs.pushRadius = gpVert.radius;
+    _denseAttribs[globalOffset] = attribs;
+
     if (s.minPoint == i && IsCyclic(s))
     {   
         //link stoke start to the end. to get 4th point for the 1st edge
@@ -222,6 +142,7 @@ void MoveToDenseArray(uint3 id : SV_DispatchThreadID)
         uint globalOffsetEnd = tail.strokePointsOffset + tail.totalStrokeLength + 1;
         _denseArray[globalOffsetEnd] = gpVert;
         _colorArray[globalOffsetEnd] = gpColor;
+        _denseAttribs[globalOffsetEnd] = attribs;
     }
 }
 
@@ -229,7 +150,7 @@ void MoveToDenseArray(uint3 id : SV_DispatchThreadID)
 void BuildDenseNextPointers(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _NumFaces) return;
+    if (i >= _DenseCount) return;
 
     GreasePencilStrokeVert v = _denseArray[i];
     if (v.mat < 0)
@@ -239,7 +160,7 @@ void BuildDenseNextPointers(uint3 id : SV_DispatchThreadID)
     }
 
     int next = (int)(i + 1u);
-    if (next >= (int)_NumFaces)
+    if (next >= (int)_DenseCount)
     {
         _denseNextPointerDst[i] = -1;
         return;
@@ -259,7 +180,7 @@ void BuildDenseNextPointers(uint3 id : SV_DispatchThreadID)
 void InitDenseScreenDistances(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _NumFaces) return;
+    if (i >= _DenseCount) return;
 
     GreasePencilStrokeVert v = _denseArray[i];
     if (v.mat < 0)
@@ -268,10 +189,10 @@ void InitDenseScreenDistances(uint3 id : SV_DispatchThreadID)
         return;
     }
 
-    int succ = i + 1u;
+    uint succ = i + 1u;
     float d = 0.0f;
 
-    if (succ < _NumFaces)
+    if (succ < _DenseCount)
     {
         GreasePencilStrokeVert vn = _denseArray[succ];
         if (vn.mat >= 0 && vn.stroke_id == v.stroke_id)
@@ -287,7 +208,7 @@ void InitDenseScreenDistances(uint3 id : SV_DispatchThreadID)
 void DensePointerJumpDistances(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _NumFaces) return;
+    if (i >= _DenseCount) return;
 
     GreasePencilStrokeVert v = _denseArray[i];
     if (v.mat < 0)
@@ -315,73 +236,15 @@ void DensePointerJumpDistances(uint3 id : SV_DispatchThreadID)
 void FinalizeDenseScreenDistances(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _NumFaces) return;
+    if (i >= _DenseCount) return;
     _denseArray[i].u_stroke = _denseUStrokeSrc[i];
-}
-
-float2 safe_normalize_2d(float2 v)
-{
-    float len_sq = dot(v, v);
-    if (len_sq <= 1e-12f) return float2(0.0f, 0.0f);
-    return v * rsqrt(len_sq);
-}
-
-float2 perpendicular_ccw(float2 v)
-{
-    return float2(-v.y, v.x);
-}
-
-int GetPrevPointIndex(int i, GreasePencilStrokeVert v)
-{
-    int prev = i - 1;
-    if (prev < 0)
-    {
-        return -1;
-    }
-
-    GreasePencilStrokeVert vp = _denseArray[prev];
-    if (vp.mat >= 0 && vp.stroke_id == v.stroke_id) return prev;
-
-    if (is_cyclic(v))
-    {
-        int last = vp.stroke_id - 2;
-        if (last >= 0)
-        {
-            GreasePencilStrokeVert vl = _denseArray[last];
-            if (vl.mat >= 0 && vl.stroke_id == v.stroke_id) return last;
-        }
-    }
-
-    return -1;
-}
-
-int GetNextPointIndex(int i, GreasePencilStrokeVert v)
-{
-    int next = i + 1;
-    if (next < (int)_NumFaces)
-    {
-        GreasePencilStrokeVert vn = _denseArray[next];
-        if (vn.mat >= 0 && vn.stroke_id == v.stroke_id) return next;
-    }
-
-    if (is_cyclic(v))
-    {
-        int first = v.stroke_id + 2;
-        if (first < (int)_NumFaces)
-        {
-            GreasePencilStrokeVert vf = _denseArray[first];
-            if (vf.mat >= 0 && vf.stroke_id == v.stroke_id) return first;
-        }
-    }
-
-    return -1;
 }
 
 [numthreads(128,1,1)]
 void OffsetDenseScreenPositions(uint3 id : SV_DispatchThreadID)
 {
     uint i = id.x;
-    if (i >= _NumFaces) return;
+    if (i >= _DenseCount) return;
 
     GreasePencilStrokeVert strokeVert = _denseArray[i];
     if (strokeVert.mat < 0) return;
@@ -428,8 +291,11 @@ void OffsetDenseScreenPositions(uint3 id : SV_DispatchThreadID)
     // }
     // offset_dir = float2(1,0);
     
+    // no shift requested: keep the point (also avoids 0 * inf at hairpin turns)
+    if (_LateralShiftFactor == 0.0f && _LateralShiftConstant == 0.0f) return;
+
     float2 miter = perpendicular_ccw(miter_tan);
-    miter = miter / miter_dot;
+    miter = miter / max(abs(miter_dot), 1e-3f) * (miter_dot < 0.0f ? -1.0f : 1.0f);
     
     /* The radius attribute can have negative values. Make sure that it's not negative by clamping to 0. */
     float radius = stroke_radius_modulate(strokeVert.radius);

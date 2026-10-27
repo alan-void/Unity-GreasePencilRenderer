@@ -1,0 +1,415 @@
+// Edge based silhouette with "silhouetteness" falloff and branch joining.
+// Port of Blender's GN "Silhouette Edges" + "Silhouette Edges • Branch Join" groups (as used by
+// "Silhouetteness Transfer"). Works on a welded edge graph built on the CPU (EdgeTopology).
+//
+// Stroke elements are half-edges: element h (< 2E) is the half-edge a->b of edge h>>1 and contributes the
+// point at a. Element 2E+h is the terminal point b of h, used when the chain stops after h.
+// Every stroke is generated in both directions; DedupeChains keeps one of the two after tail discovery.
+#pragma kernel TransformVertices
+#pragma kernel ComputeFaces
+#pragma kernel ClassifyEdges
+#pragma kernel ResolveVertices
+#pragma kernel BuildHalfEdges
+#pragma kernel DedupeChains
+
+#include "silhouette_defines.hh"
+#include "stroke_attributes.hh"
+#include "lineart_camera.hh"
+
+struct EgVertex
+{
+    float3 position;
+    float3 lineNormal;
+};
+
+struct EgFace
+{
+    float3 normal;
+    float3 center;
+};
+
+struct EgEdgeState
+{
+    float3 dir;     // outward screen perpendicular direction
+    float weight;   // outline_edge_weight
+    uint drawn;
+};
+
+struct EgVertexState
+{
+    int pairA;      // edges continuing through this vertex (-1 when the vertex ends strokes)
+    int pairB;
+    float meanWeight;
+};
+
+StructuredBuffer<EgVertex> _EgVertices;
+StructuredBuffer<int3> _EgTriangles;
+StructuredBuffer<EgFace> _EgFacesLocal;    // polygon normal / centre per triangle, mesh space
+StructuredBuffer<int4> _EgEdges;           // v0, v1, f0, f1 (f1 = -1 on boundary edges)
+StructuredBuffer<int> _EgVertEdgeOffsets;  // CSR offsets, V + 1 entries
+StructuredBuffer<int> _EgVertEdges;
+
+RWStructuredBuffer<EgVertex> _EgWorldVertices;
+RWStructuredBuffer<EgFace> _EgFaces;
+RWStructuredBuffer<EgEdgeState> _EgEdgeStates;
+RWStructuredBuffer<EgVertexState> _EgVertexStates;
+
+RWStructuredBuffer<SilhouetteStrokeEdge> _outStrokes;
+RWStructuredBuffer<StrokePointAttributes> _outAttribs;
+
+uint _EgNumVertices;
+uint _EgNumFaces;
+uint _EgNumEdges;
+
+float4x4 _ObjectToWorld;
+float4x4 _ObjectToWorldIT;
+
+uint _IncludeBoundary;
+uint _SkipConcave;
+float _ConcaveTolerance;
+float _OutlineFalloff;
+uint _UndersideFalloff;
+uint _ScaleBySpan;
+float _FullSpan;
+uint _ScaleByPolar;
+uint _JoinBranches;
+float _StraightnessWeight;
+
+#define MAX_BRANCH_EDGES 4
+#define NO_EDGE -1
+
+float3 SafeNormalize(float3 v)
+{
+    float l = length(v);
+    return l > 1e-12f ? v / l : float3(0, 0, 0);
+}
+
+[numthreads(128,1,1)]
+void TransformVertices(uint3 id : SV_DispatchThreadID)
+{
+    uint v = id.x;
+    if (v >= _EgNumVertices) return;
+    EgVertex src = _EgVertices[v];
+    EgVertex dst;
+    dst.position = mul(_ObjectToWorld, float4(src.position, 1.0f)).xyz;
+    dst.lineNormal = SafeNormalize(mul((float3x3)_ObjectToWorldIT, src.lineNormal));
+    _EgWorldVertices[v] = dst;
+}
+
+[numthreads(128,1,1)]
+void ComputeFaces(uint3 id : SV_DispatchThreadID)
+{
+    uint f = id.x;
+    if (f >= _EgNumFaces) return;
+    EgFace local = _EgFacesLocal[f];
+    EgFace face;
+    face.normal = SafeNormalize(mul((float3x3)_ObjectToWorldIT, local.normal));
+    face.center = mul(_ObjectToWorld, float4(local.center, 1.0f)).xyz;
+    _EgFaces[f] = face;
+}
+
+// sine of the face's elevation above grazing, as seen from its centre
+float FaceSinElevation(EgFace face)
+{
+    float3 view = ViewVector(face.center);
+    return dot(face.normal, view) / max(length(view), 1e-12f);
+}
+
+[numthreads(128,1,1)]
+void ClassifyEdges(uint3 id : SV_DispatchThreadID)
+{
+    uint e = id.x;
+    if (e >= _EgNumEdges) return;
+
+    int4 edge = _EgEdges[e];
+    float3 p1 = _EgWorldVertices[edge.x].position;
+    float3 p2 = _EgWorldVertices[edge.y].position;
+    float3 mid = 0.5f * (p1 + p2);
+    float3 viewMid = ViewVector(mid);
+
+    EgFace f0 = _EgFaces[edge.z];
+    bool boundary = edge.w < 0;
+    EgFace f1 = f0;
+    if (!boundary) f1 = _EgFaces[edge.w];
+
+    bool silhouette;
+    float falloffWeight = 0.0f;
+
+    if (boundary)
+    {
+        silhouette = _IncludeBoundary != 0;
+    }
+    else
+    {
+        float a0 = FaceSinElevation(f0);
+        float a1 = FaceSinElevation(f1);
+        bool front0 = a0 > 0.0f;
+        bool front1 = a1 > 0.0f;
+
+        float angle = acos(clamp(dot(f0.normal, f1.normal), -1.0f, 1.0f));
+        bool concaveShape = dot(f0.normal, f1.center - f0.center) > 0.0f;
+        float signedAngle = concaveShape ? -angle : angle;
+        bool dropped = (_SkipConcave != 0) && (signedAngle < -_ConcaveTolerance);
+
+        silhouette = (front0 != front1) && !dropped;
+
+        if (!silhouette && !dropped && _OutlineFalloff > 0.0f)
+        {
+            float span = _ScaleBySpan != 0 ? min(angle / max(_FullSpan, 1e-6f), 1.0f) : 1.0f;
+            float polar = 1.0f;
+            if (_ScaleByPolar != 0)
+            {
+                float s = length(cross(SafeNormalize(p2 - p1), SafeNormalize(viewMid)));
+                polar = s * s;
+            }
+            float thf = max(_OutlineFalloff * span * polar, 1e-6f);
+
+            if (min(a0, a1) > 0.0f)
+            {
+                falloffWeight = saturate(1.0f - asin(min(min(a0, a1), 1.0f)) / thf);
+            }
+            else if (_UndersideFalloff != 0 && max(a0, a1) < 0.0f)
+            {
+                falloffWeight = saturate(1.0f - asin(min(-max(a0, a1), 1.0f)) / thf);
+            }
+        }
+    }
+
+    EgEdgeState state;
+    state.drawn = (silhouette || falloffWeight > 0.0f) ? 1u : 0u;
+    state.weight = state.drawn != 0 ? (silhouette ? 1.0f : falloffWeight) : 0.0f;
+
+    float3 d = SafeNormalize(cross(p2 - p1, viewMid));
+    float3 faceMean = boundary ? f0.center : 0.5f * (f0.center + f1.center);
+    if (dot(d, mid - faceMean) < 0.0f) d = -d;
+    state.dir = d;
+
+    _EgEdgeStates[e] = state;
+}
+
+int OtherVertex(int4 edge, int v)
+{
+    return edge.x == v ? edge.y : edge.x;
+}
+
+// edge direction leaving v, projected onto the view plane at v
+float3 BranchDirection(int e, int v, float3 p)
+{
+    int4 edge = _EgEdges[e];
+    float3 dk = _EgWorldVertices[OtherVertex(edge, v)].position - p;
+    float3 w = ViewVector(p);
+    float ww = max(dot(w, w), 1e-12f);
+    return SafeNormalize(dk - w * dot(dk, w) / ww);
+}
+
+[numthreads(128,1,1)]
+void ResolveVertices(uint3 id : SV_DispatchThreadID)
+{
+    uint v = id.x;
+    if (v >= _EgNumVertices) return;
+
+    int begin = _EgVertEdgeOffsets[v];
+    int end = _EgVertEdgeOffsets[v + 1];
+
+    // top drawn edges by priority (weight desc, index asc)
+    int top[MAX_BRANCH_EDGES] = { NO_EDGE, NO_EDGE, NO_EDGE, NO_EDGE };
+    float topW[MAX_BRANCH_EDGES] = { -1.0f, -1.0f, -1.0f, -1.0f };
+    int drawnCount = 0;
+    float weightSum = 0.0f;
+
+    for (int k = begin; k < end; ++k)
+    {
+        int e = _EgVertEdges[k];
+        EgEdgeState s = _EgEdgeStates[e];
+        weightSum += s.weight;
+        if (s.drawn == 0) continue;
+        drawnCount++;
+
+        int ce = e;
+        float cw = s.weight;
+        [unroll]
+        for (int j = 0; j < MAX_BRANCH_EDGES; ++j)
+        {
+            bool better = top[j] == NO_EDGE || cw > topW[j] || (cw == topW[j] && ce < top[j]);
+            if (better)
+            {
+                int te = top[j]; float tw = topW[j];
+                top[j] = ce; topW[j] = cw;
+                ce = te; cw = tw;
+                if (ce == NO_EDGE) break;
+            }
+        }
+    }
+
+    EgVertexState state;
+    state.meanWeight = end > begin ? weightSum / (float)(end - begin) : 0.0f;
+    state.pairA = NO_EDGE;
+    state.pairB = NO_EDGE;
+
+    if (drawnCount == 2)
+    {
+        state.pairA = top[0];
+        state.pairB = top[1];
+    }
+    else if (drawnCount > 2 && _JoinBranches != 0)
+    {
+        float3 p = _EgWorldVertices[v].position;
+        float3 u[MAX_BRANCH_EDGES];
+        [unroll]
+        for (int j = 0; j < MAX_BRANCH_EDGES; ++j)
+        {
+            u[j] = top[j] != NO_EDGE ? BranchDirection(top[j], v, p) : float3(0, 0, 0);
+        }
+
+        float bestScore = -1e30f;
+        [unroll]
+        for (int a = 0; a < MAX_BRANCH_EDGES; ++a)
+        {
+            [unroll]
+            for (int b = a + 1; b < MAX_BRANCH_EDGES; ++b)
+            {
+                float score = (top[a] == NO_EDGE || top[b] == NO_EDGE)
+                    ? -1e9f
+                    : topW[a] + topW[b] + _StraightnessWeight * (1.0f - dot(u[a], u[b])) * 0.5f;
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    state.pairA = top[a];
+                    state.pairB = top[b];
+                }
+            }
+        }
+    }
+
+    _EgVertexStates[v] = state;
+}
+
+// the edge continuing `e` through vertex v, or NO_EDGE when the stroke stops at v
+int ContinuationAt(int v, int e)
+{
+    EgVertexState s = _EgVertexStates[v];
+    if (s.pairA == e) return s.pairB;
+    if (s.pairB == e) return s.pairA;
+    return NO_EDGE;
+}
+
+int HalfEdgeLeaving(int e, int v)
+{
+    return (e << 1) | (_EgEdges[e].x == v ? 0 : 1);
+}
+
+StrokePointAttributes PointAttributes(int v, int e, int other)
+{
+    EgEdgeState se = _EgEdgeStates[e];
+    float3 meanDir = se.dir;
+    float weight = se.weight;
+    if (other != NO_EDGE)
+    {
+        EgEdgeState so = _EgEdgeStates[other];
+        meanDir = 0.5f * (se.dir + so.dir);
+        weight = max(weight, so.weight);
+    }
+
+    StrokePointAttributes a = DefaultStrokePointAttributes(_EgWorldVertices[v].lineNormal);
+    a.weight = weight;
+    a.miter = 1.0f / max(length(meanDir), 1e-6f);
+    a.meanWeight = _EgVertexStates[v].meanWeight;
+    return a;
+}
+
+SilhouetteStrokeEdge MakeElement(float3 pos, int adj, float3 dir)
+{
+    SilhouetteStrokeEdge s;
+    s.pos = pos;
+    s.adj = adj;
+    s.faceNormal = dir;
+    s.minPoint = 0;
+    s.rank = 0;
+    s.flags = 0;
+    s.totalStrokeLength = 0;
+    s.strokePointsOffset = 0;
+    return s;
+}
+
+[numthreads(128,1,1)]
+void BuildHalfEdges(uint3 id : SV_DispatchThreadID)
+{
+    uint h = id.x;
+    uint numHalfEdges = 2u * _EgNumEdges;
+    if (h >= numHalfEdges) return;
+
+    uint terminal = numHalfEdges + h;
+    int e = (int)(h >> 1);
+    int4 edge = _EgEdges[e];
+    EgEdgeState state = _EgEdgeStates[e];
+
+    if (state.drawn == 0)
+    {
+        _outStrokes[h].flags = STROKE_FLAG_IS_INVALID;
+        _outStrokes[terminal].flags = STROKE_FLAG_IS_INVALID;
+        return;
+    }
+
+    int a = (h & 1u) == 0 ? edge.x : edge.y;
+    int b = (h & 1u) == 0 ? edge.y : edge.x;
+
+    int nextEdge = ContinuationAt(b, e);
+    int next = nextEdge != NO_EDGE ? HalfEdgeLeaving(nextEdge, b) : (int)terminal;
+
+    _outStrokes[h] = MakeElement(_EgWorldVertices[a].position, next, state.dir);
+    _outAttribs[h] = PointAttributes(a, e, ContinuationAt(a, e));
+
+    if (nextEdge != NO_EDGE)
+    {
+        _outStrokes[terminal].flags = STROKE_FLAG_IS_INVALID;
+    }
+    else
+    {
+        _outStrokes[terminal] = MakeElement(_EgWorldVertices[b].position, ADJ_NONE, state.dir);
+        _outAttribs[terminal] = PointAttributes(b, e, NO_EDGE);
+    }
+}
+
+bool LessThan(float3 a, float3 b)
+{
+    if (a.x != b.x) return a.x < b.x;
+    if (a.y != b.y) return a.y < b.y;
+    return a.z < b.z;
+}
+
+// same ordering EdgesToStrokes uses to pick chain tails
+bool LessThan(SilhouetteStrokeEdge a, SilhouetteStrokeEdge b)
+{
+    if (a.adj != b.adj)
+    {
+        if (a.adj == ADJ_NONE) return true;
+        if (b.adj == ADJ_NONE) return false;
+    }
+    return LessThan(a.pos, b.pos);
+}
+
+// Each stroke exists twice (once per direction). Keep the chain whose tail sorts first.
+[numthreads(128,1,1)]
+void DedupeChains(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    uint numHalfEdges = 2u * _EgNumEdges;
+    if (i >= 2u * numHalfEdges) return;
+
+    SilhouetteStrokeEdge s = _outStrokes[i];
+    if (IsInvalid(s)) return;
+
+    uint h = i < numHalfEdges ? i : i - numHalfEdges;
+    uint twin = h ^ 1u;
+
+    uint tailA = s.minPoint;
+    uint tailB = _outStrokes[twin].minPoint;
+    SilhouetteStrokeEdge ta = _outStrokes[tailA];
+    SilhouetteStrokeEdge tb = _outStrokes[tailB];
+
+    bool keep = LessThan(ta, tb) || (!LessThan(tb, ta) && tailA < tailB);
+    if (!keep)
+    {
+        _outStrokes[i].flags = STROKE_FLAG_IS_INVALID;
+    }
+}
