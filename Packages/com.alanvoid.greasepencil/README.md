@@ -30,3 +30,10 @@ or, from git:
 
 Compute shaders are loaded from `Resources/GreasePencilRenderer/...`; shader includes use
 `Packages/com.alanvoid.greasepencil/...` paths, so the package name must not change.
+
+## Materials
+
+| Material | Use |
+|---|---|
+| `Lineart/Pencil.mat` | Textured pencil look (scatter, random pixel drop). |
+| `GreasePencil/GreasePencilSolid.mat` | Solid alternative to `Pencil.mat`: flat colour, round caps, tapers from the stroke geometry, no texture. Generic, for any `SilhouetteRenderer`. |
