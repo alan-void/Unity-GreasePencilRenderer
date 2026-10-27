@@ -1,0 +1,164 @@
+// Stroke stylization passes run on the dense Grease Pencil layout (after StrokesToGreasePencil).
+// Ports of the Blender GN outline post-processing:
+//   ApplyRadius   radius = R * min(meanWeight, weight) * radiusVar, push_radius = R * min(meanWeight, weight), corner type
+//   ApplyProfile  "Stroke Profile" (Start and End Tapers, distances measured in Blender "pixels")
+//   ApplyPush     "Stroke Push" / "Edge Lines Push" (world mode)
+//   ThinSpikes    sharp corner spike thinning of "Edge Lines Push"
+#pragma kernel ApplyRadius
+#pragma kernel ApplyProfile
+#pragma kernel ApplyPush
+#pragma kernel ThinSpikes
+
+#include "silhouette_defines.hh"
+#include "stroke_attributes.hh"
+#include "lineart_camera.hh"
+#include "Packages/com.alanvoid.greasepencil/Runtime/Resources/GreasePencilRenderer/GreasePencil/gpencil_info.hh"
+#include "Packages/com.alanvoid.greasepencil/Runtime/Resources/GreasePencilRenderer/GreasePencil/gpencil_defines.hh"
+#include "Packages/com.alanvoid.greasepencil/Runtime/Resources/GreasePencilRenderer/GreasePencil/draw_grease_pencil_lib.hlsl"
+
+RWStructuredBuffer<GreasePencilStrokeVert> _denseArray;
+RWStructuredBuffer<StrokePointAttributes> _denseAttribs;
+uint _DenseCount;
+
+#include "dense_stroke_lib.hh"
+
+// ApplyRadius
+float _StrokeRadius;
+uint _UseWeights;
+uint _UseRadiusVariation;
+float _MiterAngle;     // 0 = round, PI = flat, else sharp
+
+// ApplyProfile
+StructuredBuffer<float> _ProfileCurves; // [start curve samples][end curve samples]
+uint _ProfileSamples;
+float _TaperStartDistance;
+float _TaperEndDistance;
+float _ProfileStrength;
+float _BlenderPixelsPerScreenPixel; // converts screen pixels into the profile's "pixels" (camera units * PPU)
+uint _ProfileApplyToRadius;
+uint _ProfileApplyToPush;
+
+// ApplyPush
+float _Push;
+float _PushOffset;
+float _MaxCornerPush;
+
+// ThinSpikes
+float _MaxSpikeLength;
+
+bool IsValidPoint(uint i, out GreasePencilStrokeVert v)
+{
+    v = _denseArray[i];
+    return v.mat >= 0;
+}
+
+[numthreads(128,1,1)]
+void ApplyRadius(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _DenseCount) return;
+    GreasePencilStrokeVert v;
+    if (!IsValidPoint(i, v)) return;
+
+    StrokePointAttributes a = _denseAttribs[i];
+    float weight = _UseWeights != 0 ? min(a.meanWeight, a.weight) : 1.0f;
+    float pushRadius = _StrokeRadius * weight;
+    float radius = pushRadius * (_UseRadiusVariation != 0 ? a.radiusVar : 1.0f);
+
+    a.pushRadius = pushRadius;
+    _denseAttribs[i] = a;
+
+    _denseArray[i].radius = radius;
+    _denseArray[i].packed_asp_hard_rot = pack_rotation_aspect_hardness_miter(0.0f, 1.0f, 0.0f, _MiterAngle);
+}
+
+// Y of a sampled 0..1 profile curve, nearest sample like Blender's Sample Curve at "Profile Resolution"
+float SampleProfile(uint curve, float x)
+{
+    uint n = max(_ProfileSamples, 1u);
+    uint idx = (uint)round(saturate(x) * (n - 1));
+    return _ProfileCurves[curve * n + idx];
+}
+
+[numthreads(128,1,1)]
+void ApplyProfile(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _DenseCount) return;
+    GreasePencilStrokeVert v;
+    if (!IsValidPoint(i, v)) return;
+
+    // u_stroke is the screen distance to the end of the stroke; the first point holds the full length.
+    uint first = (uint)v.stroke_id + 1u;
+    float len = _denseArray[first].u_stroke * _BlenderPixelsPerScreenPixel;
+    float end = v.u_stroke * _BlenderPixelsPerScreenPixel;
+    float start = max(len - end, 0.0f);
+
+    float k = min(1.0f, len / max(_TaperStartDistance + _TaperEndDistance, 1e-6f));
+    float ts = _TaperStartDistance * k;
+    float te = _TaperEndDistance * k;
+    float mid = max(len - ts - te, 1e-6f);
+
+    float xs = 1.0f - saturate((ts - start) / max(ts, 1e-6f));
+    float xe = saturate((te - end) / max(te, 1e-6f));
+    float t = saturate((start - ts) / mid);
+
+    float y = lerp(SampleProfile(0, xs), SampleProfile(1, xe), t);
+    float scale = 1.0f + (y - 1.0f) * _ProfileStrength;
+
+    if (_ProfileApplyToRadius != 0)
+    {
+        _denseArray[i].radius = v.radius * scale;
+    }
+    if (_ProfileApplyToPush != 0)
+    {
+        _denseAttribs[i].pushRadius *= scale;
+    }
+}
+
+[numthreads(128,1,1)]
+void ApplyPush(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _DenseCount) return;
+    GreasePencilStrokeVert v;
+    if (!IsValidPoint(i, v)) return;
+
+    StrokePointAttributes a = _denseAttribs[i];
+    float lenN = length(a.normal);
+    if (lenN < 1e-8f) return;
+
+    float distance = _Push * a.pushRadius + _PushOffset;
+    float cornerFactor = clamp(a.miter, 1.0f, max(_MaxCornerPush, 1.0f));
+    v.pos += (a.normal / lenN) * distance * cornerFactor;
+    v.ss_pos = ProjectToScreen(v.pos);
+
+    _denseArray[i].pos = v.pos;
+    _denseArray[i].ss_pos = v.ss_pos;
+}
+
+float3 ProjectPerpendicular(float3 x, float3 viewDir)
+{
+    return x - viewDir * dot(x, viewDir);
+}
+
+[numthreads(128,1,1)]
+void ThinSpikes(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+    if (i >= _DenseCount) return;
+    GreasePencilStrokeVert v;
+    if (!IsValidPoint(i, v)) return;
+
+    int prev = GetPrevPointIndex((int)i, v);
+    int next = GetNextPointIndex((int)i, v);
+    if (prev < 0 || next < 0) return;
+
+    float3 viewDir = normalize(ViewVector(v.pos));
+    float3 tp = ProjectPerpendicular(_denseArray[prev].pos - v.pos, viewDir);
+    float3 tn = ProjectPerpendicular(_denseArray[next].pos - v.pos, viewDir);
+    if (dot(tp, tp) < 1e-16f || dot(tn, tn) < 1e-16f) return;
+
+    float sinHalf = sqrt(max(0.0f, (1.0f - dot(normalize(tp), normalize(tn))) * 0.5f));
+    _denseArray[i].radius = v.radius * min(1.0f, _MaxSpikeLength * sinHalf);
+}

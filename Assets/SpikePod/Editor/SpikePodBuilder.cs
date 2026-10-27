@@ -11,6 +11,8 @@ using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 using Object = UnityEngine.Object;
+using GreasePencil;
+using Lineart.Silhouette;
 
 namespace SpikePod.Editor
 {

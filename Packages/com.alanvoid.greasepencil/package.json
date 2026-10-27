@@ -1,0 +1,22 @@
+{
+  "name": "com.alanvoid.greasepencil",
+  "version": "0.1.0",
+  "displayName": "Grease Pencil Renderer",
+  "description": "Blender-style Grease Pencil stroke rendering and GPU line art for URP: silhouette and edge-graph stroke extraction in compute shaders, stroke stylization, NPR toon shading and a Blender-style viewport camera.",
+  "unity": "6000.6",
+  "dependencies": {
+    "com.unity.render-pipelines.universal": "17.6.0",
+    "com.unity.inputsystem": "1.20.0"
+  },
+  "keywords": [
+    "grease-pencil",
+    "lineart",
+    "npr",
+    "toon",
+    "urp"
+  ],
+  "author": {
+    "name": "alan_void",
+    "url": "https://github.com/alanaman"
+  }
+}

@@ -27,7 +27,7 @@ Shader "Custom/test"
             #pragma fragment frag
 
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
-            #include "Assets/Resources/Common/common_shader_util.hlsl"
+            #include "Packages/com.alanvoid.greasepencil/Runtime/Resources/GreasePencilRenderer/Common/common_shader_util.hlsl"
             // Define a struct to match the one in your C# script
             struct VertexData
             {
